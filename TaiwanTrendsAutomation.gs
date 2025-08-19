@@ -55,6 +55,14 @@ function setupTriggers() {
     .timeBased().onWeekDay(ScriptApp.WeekDay.WEDNESDAY).atHour(9).create();
 }
 // Manual test
+
+
+const ALERT_KEYWORDS = ['颱風', '台風', '詐騙', '發票', '科技', 'AI', 'FinTech'];
+
+function hasAlertTrend_(keywords) {
+  return keywords.some(k => ALERT_KEYWORDS.some(alert => k.includes(alert)));
+}
+
 function runNowOnce(){ runWeeklyMonthly(); }
 
 /***** MAIN *****/
@@ -72,7 +80,7 @@ function runWeeklyMonthly() {
   const weekly  = topTrendsFromHarvest_(7,  CONFIG.WEEKLY_TOP_N);
   const monthly = topTrendsFromHarvest_(30, CONFIG.MONTHLY_TOP_N);
 
-  // 3) Mixed candidates for THIS run (always produce content)
+  // 3) Mixed candidates for THIS run (fallback if not enough trends)
   const mixedCandidates = buildCandidateTopics_(realtime.map(r => r.keyword));
 
   const weeklyIdeas = weekly.length
@@ -85,14 +93,27 @@ function runWeeklyMonthly() {
     : mixedCandidates.slice(3, Math.min(6, mixedCandidates.length))
         .map(k => ({ trend: { keyword: k, hits: 1 }, ideas: generateIdeasFor_(k) }));
 
-  // 4) Email
+  // 4) Email subject
   const subject = `${CONFIG.EMAIL_SUBJECT_PREFIX} · ${formatDate_(new Date())}`;
-  const html = renderEmailHtml_(weeklyIdeas, monthlyIdeas);
-  MailApp.sendEmail({ to: RECIPIENT, subject, htmlBody: html });
 
-  // 5) Archive ideas
+  // flatten all ideas for the HTML sender
+  const allIdeas = [
+    ...weeklyIdeas.flatMap(w => w.ideas),
+    ...monthlyIdeas.flatMap(m => m.ideas)
+  ];
+
+  // 5) Send nice HTML email
+  sendIdeasEmail_(subject, allIdeas);
+
+  // 6) Archive to Google Sheet
   if (CONFIG.WRITE_TO_SHEET) appendIdeas_(weeklyIdeas, monthlyIdeas, subject);
+
+  // 7) Optional alert check
+  if (typeof hasAlertTrend_ === "function" && hasAlertTrend_(realtime.map(r => r.keyword))) {
+    sendIdeasEmail_("⚠️ 重要提醒：偵測到警示趨勢", []);
+  }
 }
+
 
 /***** FETCH: Realtime Trends RSS *****/
 // Example: https://trends.google.com/trends/trendingsearches/realtime/rss?geo=TW&hl=zh-TW&cat=all
@@ -121,6 +142,18 @@ function getTextSafeNs_(parent, prefix, local) {
   const el = parent.getChild(local, ns);
   return el ? el.getText() : '';
 }
+
+function getLastSentTrends_() {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty('LAST_SENT_TRENDS');
+  return raw ? JSON.parse(raw) : [];
+}
+
+function saveLastSentTrends_(keywords) {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('LAST_SENT_TRENDS', JSON.stringify(keywords));
+}
+
 
 /***** HARVEST LOG & LEADERBOARDS *****/
 function getOrCreateSheet_(name) {
@@ -234,18 +267,23 @@ function generateIdeasFor_(keyword) {
   const props = PropertiesService.getScriptProperties();
   const apiKey = props.getProperty('GEMINI_API_KEY');
   const model = 'gemini-1.5-flash-latest';
-  const prompt = [
-    SYSTEM_BRIEF.trim(),
-    `語言：${CONFIG.OUTPUT_LANG}`,
-    `任務：以台灣趨勢關鍵字「${keyword}」為主題，產出至少 ${CONFIG.IDEAS_PER_TREND} 則社群貼文構想，適用 Facebook 與 Instagram。`,
-    `每則請單行輸出（避免代碼區塊），並包含以下欄位：`,
-    `Title：7~14字吸睛標題｜Description：2~3句、具行動力與互動引導｜Hashtags：3~6個 #繁中｜WhyRelevant：1句，說明與台灣科技/SaaS社群的關聯（AI/FinTech/電商/遊戲/硬體創新）。`,
-    `Category：請在 Tech／Civic／Entertainment／Other 四類中選最適合的類別`,
-    `SuggestedCTA：一句明確的行動呼籲，鼓勵互動或 SaaS 工具嘗試（如「留言分享你的看法」、「立即試用雲端工具」、「轉發提醒好友」等）`,
-    `限制：避免誇大與醫療宣稱；避免政治與仇恨；語氣專業且有熱情。`,
-    `輸出格式範例：`,
-    `- Idea 1｜Title：...｜Description：...｜Hashtags：#...｜WhyRelevant：...｜Category：Tech｜SuggestedCTA：...`
-  ].join('\n');
+
+  const prompt = `
+你是一位社群內容專家，專注於台灣科技與 SaaS 趨勢。  
+請以「${keyword}」為核心，輸出 ${CONFIG.IDEAS_PER_TREND} 則社群貼文構想，格式必須是 JSON 陣列，每個元素包含：
+{
+  "Title": "7~14字吸睛標題",
+  "Description": "2~3句描述，具行動力與互動引導",
+  "Hashtags": "#繁中 #3-6個",
+  "WhyRelevant": "一句，說明與台灣科技/SaaS社群的關聯",
+  "Category": "Tech | Civic | Entertainment | Other",
+  "SuggestedCTA": "一句明確 CTA"
+}
+
+限制：避免誇大與醫療宣稱；避免政治與仇恨；語氣專業且有熱情。  
+請輸出 **ONLY** JSON，無需文字解釋。
+`;
+
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const payload = { contents: [{ parts: [{ text: prompt }]}] };
   const res = UrlFetchApp.fetch(url, {
@@ -254,16 +292,80 @@ function generateIdeasFor_(keyword) {
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   });
-  const safeFail = () => [{
-    Title: '[AI錯誤]', Description: '無法生成內容', Hashtags: '#錯誤', WhyRelevant: '請檢查API或配額', Category: 'Other', SuggestedCTA: '回覆此郵件以協助除錯'
-  }];
-  if (res.getResponseCode() !== 200) return safeFail();
+
+  if (res.getResponseCode() !== 200) {
+    return [{
+      Title: '[AI錯誤]',
+      Description: '無法生成內容',
+      Hashtags: '#錯誤',
+      WhyRelevant: '請檢查API或配額',
+      Category: 'Other',
+      SuggestedCTA: '回覆此郵件以協助除錯'
+    }];
+  }
+
   const data = JSON.parse(res.getContentText());
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  const lines = text.split('\n').filter(l => l.trim().startsWith('-'));
-  const ideas = lines.map(parseIdeaLine_).filter(Boolean);
-  return ideas.slice(0, Math.max(CONFIG.IDEAS_PER_TREND, 5)) || safeFail();
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+
+  try {
+    return JSON.parse(text);  // now it's already clean JSON
+  } catch (e) {
+    return [{
+      Title: '[解析錯誤]',
+      Description: '無法解析JSON',
+      Hashtags: '#錯誤',
+      WhyRelevant: '請檢查輸出格式',
+      Category: 'Other',
+      SuggestedCTA: '回覆此郵件以協助除錯'
+    }];
+  }
 }
+
+function sendIdeasEmail_(subject, ideas) {
+  if (!ideas || !ideas.length) {
+    GmailApp.sendEmail(
+      Session.getActiveUser().getEmail(),
+      subject,
+      "⚠️ 本次未抓到趨勢，稍後將再嘗試。",
+      {}
+    );
+    return;
+  }
+
+  let html = `
+  <div style="font-family:Arial, sans-serif; line-height:1.6; font-size:15px; color:#222;">
+    <h2 style="margin-bottom:4px;">📈 台灣科技趨勢內容靈感</h2>
+    <p style="margin-top:0; font-size:14px; color:#555;">來源：Google Trends ｜ 語言：zh-TW</p>
+  `;
+
+  ideas.forEach(item => {
+    html += `
+    <div style="margin-bottom:24px; padding:16px; border:1px solid #e0e0e0; border-radius:8px; background:#fafafa;">
+      <h3 style="margin:0 0 10px; font-size:17px; color:#111;">🔥 趨勢：${item.Title}</h3>
+      <p><b>描述：</b> ${item.Description}</p>
+      <p><b>Hashtags：</b> ${item.Hashtags}</p>
+      <p><b>為何相關：</b> ${item.WhyRelevant}</p>
+      <p><b>分類：</b> ${item.Category}</p>
+      <p style="color:#d35400;"><b>👉 建議CTA：</b> ${item.SuggestedCTA}</p>
+    </div>
+    `;
+  });
+
+  html += `
+    <p style="font-size:13px; color:#777; margin-top:32px;">
+      自動產生 · 排程：週一 08:00 ＋ 週三 09:00（Asia/Taipei）
+    </p>
+  </div>`;
+
+  GmailApp.sendEmail(
+    Session.getActiveUser().getEmail(),
+    subject,
+    "你的信箱不支援HTML顯示，請使用支援的郵件客戶端查看。",
+    { htmlBody: html }
+  );
+}
+
+
 function parseIdeaLine_(line) {
   try {
     const normalized = line.replace(/^-\s*Idea\s*\d+\s*[|｜]?\s*/i, '');
@@ -363,6 +465,7 @@ function appendIdeas_(weeklyIdeas, monthlyIdeas, subject) {
   });
   if (rows.length) sh.getRange(sh.getLastRow()+1,1,rows.length,10).setValues(rows);
 }
+
 
 /***** UTILS *****/
 function escapeHtml_(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
